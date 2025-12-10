@@ -27,6 +27,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
+	"github.com/rs/zerolog/log"
 
 	"github.com/prometheus/alertmanager/featurecontrol"
 	"github.com/prometheus/alertmanager/inhibit"
@@ -710,15 +711,14 @@ func (n *DedupStage) Exec(ctx context.Context, _ *slog.Logger, alerts ...*types.
 	firing := []uint64{}
 	resolved := []uint64{}
 
-	var hash uint64
 	for _, a := range alerts {
-		hash = n.hash(a)
+		h := n.hash(a)
 		if a.Resolved() {
-			resolved = append(resolved, hash)
-			resolvedSet[hash] = struct{}{}
+			resolved = append(resolved, h)
+			resolvedSet[h] = struct{}{}
 		} else {
-			firing = append(firing, hash)
-			firingSet[hash] = struct{}{}
+			firing = append(firing, h)
+			firingSet[h] = struct{}{}
 		}
 	}
 
@@ -731,15 +731,51 @@ func (n *DedupStage) Exec(ctx context.Context, _ *slog.Logger, alerts ...*types.
 	}
 
 	var entry *nflogpb.Entry
-	switch len(entries) {
-	case 0:
-	case 1:
+	if len(entries) == 1 {
 		entry = entries[0]
-	default:
-		return ctx, nil, fmt.Errorf("unexpected entry result size %d", len(entries))
 	}
 
+	// ✅ Let Alertmanager decide if something changed
 	if n.needsUpdate(entry, firingSet, resolvedSet, repeatInterval) {
+		// ✅ FIRST FIRING transition (log ONCE)
+		if entry == nil && len(firing) > 0 {
+			for _, a := range alerts {
+				if !a.Resolved() {
+					log.Info().
+						Str("time", n.now().Format(time.RFC3339Nano)).
+						Str("component", "dedup").
+						Str("receiver", n.recv.GroupName).
+						Str("integration", n.recv.Integration).
+						Str("groupKey", gkey).
+						Str("alertname", string(a.Labels["alertname"])).
+						Str("fingerprint", a.Fingerprint().String()).
+						Interface("labels", a.Labels).
+						Interface("annotations", a.Annotations).
+						Msg("Alert firing")
+				}
+			}
+		}
+
+		// ✅ FIRING → RESOLVED transition (log once)
+		if entry != nil && len(firing) == 0 && len(entry.FiringAlerts) > 0 {
+
+			for _, a := range alerts {
+				if a.Resolved() {
+					log.Info().
+						Str("time", n.now().Format(time.RFC3339Nano)).
+						Str("component", "dedup").
+						Str("receiver", n.recv.GroupName).
+						Str("integration", n.recv.Integration).
+						Str("groupKey", gkey).
+						Str("alertname", string(a.Labels["alertname"])).
+						Str("fingerprint", a.Fingerprint().String()).
+						Interface("labels", a.Labels).
+						Interface("annotations", a.Annotations).
+						Msg("Alert resolved")
+				}
+			}
+		}
+
 		return ctx, alerts, nil
 	}
 	return ctx, nil, nil
@@ -787,6 +823,12 @@ func (r RetryStage) Exec(ctx context.Context, l *slog.Logger, alerts ...*types.A
 
 func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*types.Alert) (context.Context, []*types.Alert, error) {
 	var sent []*types.Alert
+	// Build structured alert info
+	type alertInfo struct {
+		Name   string `json:"alertname"`
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
 
 	// If we shouldn't send notifications for resolved alerts, but there are only
 	// resolved alerts, report them all as successfully notified (we still want the
@@ -824,6 +866,16 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*types.A
 		l = l.With("aggrGroup", groupKey)
 	}
 
+	alertDetails := make([]alertInfo, 0, len(alerts))
+	for _, a := range alerts {
+		id := a.Fingerprint().String()
+		alertDetails = append(alertDetails, alertInfo{
+			Name:   string(a.Labels["alertname"]),
+			ID:     id,
+			Status: string(a.Status()),
+		})
+	}
+
 	for {
 
 		// Always check the context first to not notify again.
@@ -837,7 +889,6 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*types.A
 					iErr = NewErrorWithReason(ContextDeadlineExceededReason, iErr)
 				}
 			}
-
 			if iErr != nil {
 				return ctx, nil, fmt.Errorf("%s/%s: notify retry canceled after %d attempts: %w", r.groupName, r.integration.String(), i, iErr)
 			}
@@ -855,42 +906,50 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*types.A
 			r.metrics.numNotificationRequestsTotal.WithLabelValues(r.labelValues...).Inc()
 			if err != nil {
 				r.metrics.numNotificationRequestsFailedTotal.WithLabelValues(r.labelValues...).Inc()
+
+				log.Error().
+					Str("time", time.Now().UTC().Format(time.RFC3339Nano)).
+					Str("component", "dispatcher").
+					Str("receiver", r.groupName).
+					Str("integration", r.integration.String()).
+					Int("attempt", i).
+					Dur("duration", dur).
+					Interface("alerts", alertDetails).
+					Err(err).
+					Msg("Notify failed")
+
 				if !retry {
 					return ctx, alerts, fmt.Errorf("%s/%s: notify retry canceled due to unrecoverable error after %d attempts: %w", r.groupName, r.integration.String(), i, err)
 				}
 				if ctx.Err() == nil {
 					if iErr == nil || err.Error() != iErr.Error() {
-						// Log the error if the context isn't done and the error isn't the same as before.
 						l.Warn("Notify attempt failed, will retry later", "attempts", i, "err", err)
 					}
-					// Save this error to be able to return the last seen error by an
-					// integration upon context timeout.
 					iErr = err
 				}
-			} else {
-				l := l.With("attempts", i, "duration", dur)
-				if i <= 1 {
-					l = l.With("alerts", fmt.Sprintf("%v", alerts))
-					l.Debug("Notify success")
-				} else {
-					l.Info("Notify success")
-				}
+				continue
+			}
 
-				return ctx, alerts, nil
-			}
-		case <-ctx.Done():
-			if iErr == nil {
-				iErr = ctx.Err()
-				if errors.Is(iErr, context.Canceled) {
-					iErr = NewErrorWithReason(ContextCanceledReason, iErr)
-				} else if errors.Is(iErr, context.DeadlineExceeded) {
-					iErr = NewErrorWithReason(ContextDeadlineExceededReason, iErr)
-				}
-			}
-			if iErr != nil {
-				return ctx, nil, fmt.Errorf("%s/%s: notify retry canceled after %d attempts: %w", r.groupName, r.integration.String(), i, iErr)
-			}
-			return ctx, nil, nil
+			// -----------------------------------------------------
+			// SUCCESS — YOUR CUSTOM NOTIFY SUCCESS LOG
+			// -----------------------------------------------------
+			log.Info().
+				Str("time", time.Now().UTC().Format(time.RFC3339Nano)).
+				Str("component", "dispatcher").
+				Str("receiver", r.groupName).
+				Str("integration", r.integration.String()).
+				Str("aggrGroup", func() string {
+					if gkey, ok := GroupKey(ctx); ok {
+						return gkey
+					}
+					return ""
+				}()).
+				Int("attempts", i).
+				Dur("duration", dur).
+				Interface("alerts", alertDetails).
+				Msg("Notify success")
+
+			return ctx, alerts, nil
 		}
 	}
 }
