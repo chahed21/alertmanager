@@ -748,10 +748,11 @@ func (n *DedupStage) Exec(ctx context.Context, _ *slog.Logger, alerts ...*types.
 						Str("integration", n.recv.Integration).
 						Str("groupKey", gkey).
 						Str("alertname", string(a.Labels["alertname"])).
-						Str("fingerprint", a.Fingerprint().String()).
+						Str("id", a.Fingerprint().String()).
+						Str("status", string(a.Status())).
 						Interface("labels", a.Labels).
 						Interface("annotations", a.Annotations).
-						Msg("Alert firing")
+						Msg("Alert firing detected")
 				}
 			}
 		}
@@ -768,7 +769,8 @@ func (n *DedupStage) Exec(ctx context.Context, _ *slog.Logger, alerts ...*types.
 						Str("integration", n.recv.Integration).
 						Str("groupKey", gkey).
 						Str("alertname", string(a.Labels["alertname"])).
-						Str("fingerprint", a.Fingerprint().String()).
+						Str("id", a.Fingerprint().String()).
+						Str("status", string(a.Status())).
 						Interface("labels", a.Labels).
 						Interface("annotations", a.Annotations).
 						Msg("Alert resolved")
