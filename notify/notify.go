@@ -825,12 +825,6 @@ func (r RetryStage) Exec(ctx context.Context, l *slog.Logger, alerts ...*types.A
 
 func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*types.Alert) (context.Context, []*types.Alert, error) {
 	var sent []*types.Alert
-	// Build structured alert info
-	type alertInfo struct {
-		Name   string `json:"alertname"`
-		ID     string `json:"id"`
-		Status string `json:"status"`
-	}
 
 	// If we shouldn't send notifications for resolved alerts, but there are only
 	// resolved alerts, report them all as successfully notified (we still want the
@@ -841,6 +835,7 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*types.A
 			return ctx, nil, errors.New("firing alerts missing")
 		}
 		if len(firing) == 0 {
+			// Nothing firing -> considered successfully notified
 			return ctx, alerts, nil
 		}
 		for _, a := range alerts {
@@ -852,31 +847,34 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*types.A
 		sent = alerts
 	}
 
+	// Prepare backoff
 	b := backoff.NewExponentialBackOff()
-	b.MaxElapsedTime = 0 // Always retry.
-
+	b.MaxElapsedTime = 0
 	tick := backoff.NewTicker(b)
 	defer tick.Stop()
 
+	// Contextual logger
+	l = l.With("receiver", r.groupName, "integration", r.integration.String())
+	groupKey := ""
+	if key, ok := GroupKey(ctx); ok {
+		groupKey = key
+		l = l.With("aggrGroup", groupKey)
+	}
+
+	// Build readable lists of alert info
+	alertNames := make([]string, 0, len(sent))
+	alertIDs := make([]string, 0, len(sent))
+
+	for _, a := range sent {
+		alertNames = append(alertNames, string(a.Labels["alertname"]))
+		alertIDs = append(alertIDs, a.Fingerprint().String())
+	}
+
+	// Retry loop
 	var (
 		i    = 0
 		iErr error
 	)
-
-	l = l.With("receiver", r.groupName, "integration", r.integration.String())
-	if groupKey, ok := GroupKey(ctx); ok {
-		l = l.With("aggrGroup", groupKey)
-	}
-
-	alertDetails := make([]alertInfo, 0, len(alerts))
-	for _, a := range alerts {
-		id := a.Fingerprint().String()
-		alertDetails = append(alertDetails, alertInfo{
-			Name:   string(a.Labels["alertname"]),
-			ID:     id,
-			Status: string(a.Status()),
-		})
-	}
 
 	for {
 
@@ -892,7 +890,8 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*types.A
 				}
 			}
 			if iErr != nil {
-				return ctx, nil, fmt.Errorf("%s/%s: notify retry canceled after %d attempts: %w", r.groupName, r.integration.String(), i, iErr)
+				return ctx, nil, fmt.Errorf("%s/%s: notify retry canceled after %d attempts: %w",
+					r.groupName, r.integration.String(), i, iErr)
 			}
 			return ctx, nil, nil
 		default:
@@ -901,11 +900,25 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*types.A
 		select {
 		case <-tick.C:
 			now := time.Now()
+
+			// 🔵 BEFORE calling Notify
+			log.Info().
+				Str("time", time.Now().UTC().Format(time.RFC3339Nano)).
+				Str("component", "dispatcher").
+				Str("receiver", r.groupName).
+				Str("integration", r.integration.String()).
+				Str("aggrGroup", groupKey).
+				Strs("alertnames", alertNames).
+				Strs("alert_ids", alertIDs).
+				Msg("Calling Notify() now")
+
 			retry, err := r.integration.Notify(ctx, sent...)
 			i++
 			dur := time.Since(now)
+
 			r.metrics.notificationLatencySeconds.WithLabelValues(r.labelValues...).Observe(dur.Seconds())
 			r.metrics.numNotificationRequestsTotal.WithLabelValues(r.labelValues...).Inc()
+
 			if err != nil {
 				r.metrics.numNotificationRequestsFailedTotal.WithLabelValues(r.labelValues...).Inc()
 
@@ -916,12 +929,14 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*types.A
 					Str("integration", r.integration.String()).
 					Int("attempt", i).
 					Dur("duration", dur).
-					Interface("alerts", alertDetails).
+					Strs("alertname", alertNames).
+					Strs("alert_id", alertIDs).
 					Err(err).
 					Msg("Notify failed")
 
 				if !retry {
-					return ctx, alerts, fmt.Errorf("%s/%s: notify retry canceled due to unrecoverable error after %d attempts: %w", r.groupName, r.integration.String(), i, err)
+					return ctx, alerts, fmt.Errorf("%s/%s: notify retry canceled due to unrecoverable error after %d attempts: %w",
+						r.groupName, r.integration.String(), i, err)
 				}
 				if ctx.Err() == nil {
 					if iErr == nil || err.Error() != iErr.Error() {
@@ -932,23 +947,17 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*types.A
 				continue
 			}
 
-			// -----------------------------------------------------
-			// SUCCESS — YOUR CUSTOM NOTIFY SUCCESS LOG
-			// -----------------------------------------------------
+			// 🔵 SUCCESS — clean log
 			log.Info().
 				Str("time", time.Now().UTC().Format(time.RFC3339Nano)).
 				Str("component", "dispatcher").
 				Str("receiver", r.groupName).
 				Str("integration", r.integration.String()).
-				Str("aggrGroup", func() string {
-					if gkey, ok := GroupKey(ctx); ok {
-						return gkey
-					}
-					return ""
-				}()).
+				Str("aggrGroup", groupKey).
 				Int("attempts", i).
 				Dur("duration", dur).
-				Interface("alerts", alertDetails).
+				Strs("alertname", alertNames).
+				Strs("alert_id", alertIDs).
 				Msg("Notify success")
 
 			return ctx, alerts, nil
